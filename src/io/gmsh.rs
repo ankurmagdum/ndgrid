@@ -747,7 +747,6 @@ where
     fn import_from_v1(&mut self, mut reader: BufReader<File>) {
         let mut line = String::new();
 
-        //let _ = reader.read_line(&mut line).expect("Failed to read line");
         read_line!(reader, line);
         let num_nodes = line
             .trim()
@@ -755,8 +754,6 @@ where
             .expect("Could not parse num nodes");
 
         for _ in 0..num_nodes {
-            //line.clear();
-            //let _ = reader.read_line(&mut line).expect("Failed to read line");
             read_line!(reader, line);
             let line = line.trim().split(" ").collect::<Vec<&str>>();
 
@@ -781,8 +778,6 @@ where
             read_line!(reader, line);
         }
 
-        //line.clear();
-        //let _ = reader.read_line(&mut line).expect("Failed to read line");
         read_line!(reader, line);
         let num_elements = line
             .trim()
@@ -790,8 +785,6 @@ where
             .expect("Could not parse num nodes");
 
         for _ in 0..num_elements {
-            //line.clear();
-            //let _ = reader.read_line(&mut line).expect("Failed to read line");
             read_line!(reader, line);
             let line = line.trim().split(" ").collect::<Vec<&str>>();
 
