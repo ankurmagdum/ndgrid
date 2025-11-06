@@ -19,6 +19,13 @@ macro_rules! read_exact {
     }};
 }
 
+macro_rules! read_line {
+    ($reader: expr, $line: expr) => {{
+        $line.clear();
+        let _ = $reader.read_line(&mut $line).expect("Failed to read line");
+    }};
+}
+
 fn get_permutation_to_gmsh(cell_type: ReferenceCellType, degree: usize) -> Vec<usize> {
     match cell_type {
         ReferenceCellType::Triangle => match degree {
@@ -140,16 +147,14 @@ where
     let mut nodes = Vec::new();
     let mut line = String::new();
 
-    let _ = reader.read_line(&mut line);
+    read_line!(reader, line);
     let num_nodes = line
         .trim()
         .parse::<usize>()
         .expect("Cout not parse number of nodes");
 
     for _ in 0..num_nodes {
-        line.clear();
-        let _ = reader.read_line(&mut line);
-
+        read_line!(reader, line);
         let node_line = line.trim().split(" ").collect::<Vec<_>>();
         let (tag, coords) = node_line.split_at(1);
 
@@ -177,17 +182,14 @@ fn parse_element_ascii_v2(
     let mut elements = Vec::new();
     let mut line = String::new();
 
-    let _ = reader.read_line(&mut line);
+    read_line!(reader, line);
     let num_elements = line
         .trim()
         .parse::<usize>()
         .expect("Cout not parse number of nodes");
 
     for _ in 0..num_elements {
-        line.clear();
-        let Ok(_) = reader.read_line(&mut line) else {
-            panic!("Unable to read element line");
-        };
+        read_line!(reader, line);
         let line = line.trim().split(" ").collect::<Vec<&str>>();
 
         let (a, rem_line) = line.split_at(3);
@@ -231,7 +233,7 @@ where
     let mut nodes = Vec::new();
     let mut line = String::new();
 
-    let _ = reader.read_line(&mut line);
+    read_line!(reader, line);
     let [num_entity_blocks, _num_nodes, _min_node_tag, _max_node_tag] = line
         .trim()
         .split(" ")
@@ -242,8 +244,7 @@ where
     };
 
     for _ in 0..num_entity_blocks {
-        line.clear();
-        let _ = reader.read_line(&mut line);
+        read_line!(reader, line);
 
         let [_entity_dim, _entity_tag, parametric, num_nodes_in_block] = line
             .trim()
@@ -259,17 +260,13 @@ where
 
         let mut tags = Vec::new();
         for _ in 0..num_nodes_in_block {
-            line.clear();
-            let _ = reader.read_line(&mut line);
-
+            read_line!(reader, line);
             tags.push(line.trim().parse::<usize>().expect("Could not parse tag"));
         }
 
         let mut coords = Vec::new();
         for _ in 0..num_nodes_in_block {
-            line.clear();
-            let _ = reader.read_line(&mut line);
-
+            read_line!(reader, line);
             let coord = line
                 .trim()
                 .split(" ")
@@ -281,6 +278,7 @@ where
                     }
                 })
                 .collect::<Vec<_>>();
+
             coords.push(coord);
         }
 
@@ -297,7 +295,7 @@ fn parse_element_ascii_v4(
     let mut elements = Vec::new();
     let mut line = String::new();
 
-    let _ = reader.read_line(&mut line);
+    read_line!(reader, line);
     let [
         num_entity_blocks,
         _num_elements,
@@ -313,8 +311,7 @@ fn parse_element_ascii_v4(
     };
 
     for _ in 0..num_entity_blocks {
-        line.clear();
-        let _ = reader.read_line(&mut line);
+        read_line!(reader, line);
         let [
             _entity_dim,
             _entity_tag,
@@ -332,8 +329,7 @@ fn parse_element_ascii_v4(
         let gmsh_perm = get_permutation_to_gmsh(cell_type, degree);
 
         for _ in 0..num_elements_in_block {
-            line.clear();
-            let _ = reader.read_line(&mut line);
+            read_line!(reader, line);
 
             let parsed_line = line
                 .trim()
@@ -751,15 +747,17 @@ where
     fn import_from_v1(&mut self, mut reader: BufReader<File>) {
         let mut line = String::new();
 
-        let _ = reader.read_line(&mut line);
+        //let _ = reader.read_line(&mut line).expect("Failed to read line");
+        read_line!(reader, line);
         let num_nodes = line
             .trim()
             .parse::<usize>()
             .expect("Could not parse num nodes");
 
         for _ in 0..num_nodes {
-            line.clear();
-            let _ = reader.read_line(&mut line);
+            //line.clear();
+            //let _ = reader.read_line(&mut line).expect("Failed to read line");
+            read_line!(reader, line);
             let line = line.trim().split(" ").collect::<Vec<&str>>();
 
             let (tag, coords) = line.split_at(1);
@@ -778,22 +776,23 @@ where
             self.add_point(tag, &coords[..self.gdim()]);
         }
 
-        // Skip $NOD line.
-        let _ = reader.read_line(&mut line);
+        // Skip $ENDNOD and $ELM line.
+        for _ in 0..2 {
+            read_line!(reader, line);
+        }
 
-        // Skip $ELM line.
-        let _ = reader.read_line(&mut line);
-
-        line.clear();
-        let _ = reader.read_line(&mut line);
+        //line.clear();
+        //let _ = reader.read_line(&mut line).expect("Failed to read line");
+        read_line!(reader, line);
         let num_elements = line
             .trim()
             .parse::<usize>()
             .expect("Could not parse num nodes");
 
         for _ in 0..num_elements {
-            line.clear();
-            let _ = reader.read_line(&mut line);
+            //line.clear();
+            //let _ = reader.read_line(&mut line).expect("Failed to read line");
+            read_line!(reader, line);
             let line = line.trim().split(" ").collect::<Vec<&str>>();
 
             let (a, node_tags) = line.split_at(5);
@@ -844,35 +843,22 @@ where
         let mut line = String::new();
         let is_v2 = version.starts_with("2");
 
-        let parse_nodes = |reader: &mut BufReader<File>| {
-            if is_v2 {
-                if is_binary {
-                    parse_node_binary_v2(reader, data_size, is_le)
-                } else {
-                    parse_node_ascii_v2(reader)
-                }
-            } else if is_binary {
-                parse_node_binary_v4(reader, data_size, is_le)
-            } else {
-                parse_node_ascii_v4(reader)
-            }
+        let parse_nodes = |reader: &mut BufReader<File>| match (is_v2, is_binary) {
+            (true, true) => parse_node_binary_v2(reader, data_size, is_le),
+            (true, false) => parse_node_ascii_v2(reader),
+            (false, true) => parse_node_binary_v4(reader, data_size, is_le),
+            (false, false) => parse_node_ascii_v4(reader),
         };
 
-        let parse_elements = |reader: &mut BufReader<File>| {
-            if is_v2 {
-                if is_binary {
-                    parse_element_binary_v2(reader, is_le)
-                } else {
-                    parse_element_ascii_v2(reader)
-                }
-            } else if is_binary {
-                parse_element_binary_v4(reader, data_size, is_le)
-            } else {
-                parse_element_ascii_v4(reader)
-            }
+        let parse_elements = |reader: &mut BufReader<File>| match (is_v2, is_binary) {
+            (true, true) => parse_element_binary_v2(reader, is_le),
+            (true, false) => parse_element_ascii_v2(reader),
+            (false, true) => parse_element_binary_v4(reader, data_size, is_le),
+            (false, false) => parse_element_ascii_v4(reader),
         };
 
         loop {
+            line.clear();
             let Ok(num_bytes) = reader.read_line(&mut line) else {
                 continue;
             };
@@ -884,22 +870,16 @@ where
 
             match line.trim() {
                 "$Nodes" => {
-                    let nodes = parse_nodes(&mut reader);
-                    nodes.iter().for_each(|(tag, coords)| {
-                        self.add_point(*tag, &coords[..self.gdim()]);
-                    });
-                    line.clear();
+                    for (tag, coords) in parse_nodes(&mut reader) {
+                        self.add_point(tag, &coords[..self.gdim()]);
+                    }
                 }
                 "$Elements" => {
-                    let elements = parse_elements(&mut reader);
-                    elements.iter().for_each(|(tag, cell, cell_type, degree)| {
-                        self.add_cell_from_nodes_and_type(*tag, &cell, *cell_type, *degree);
-                    });
-                    line.clear();
+                    for (tag, cell, cell_type, degree) in parse_elements(&mut reader) {
+                        self.add_cell_from_nodes_and_type(tag, &cell, cell_type, degree);
+                    }
                 }
-                _ => {
-                    line.clear();
-                }
+                _ => {}
             }
         }
     }
