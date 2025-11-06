@@ -10,6 +10,15 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, Read};
 use std::str::FromStr;
 
+const GMSH_INT_SIZE: usize = 4;
+
+macro_rules! read_exact {
+    ($reader: expr, $buf: expr, $size: expr, $msg: expr) => {{
+        $buf.resize($size, 0);
+        $reader.read_exact(&mut $buf).expect($msg);
+    }};
+}
+
 fn get_permutation_to_gmsh(cell_type: ReferenceCellType, degree: usize) -> Vec<usize> {
     match cell_type {
         ReferenceCellType::Triangle => match degree {
@@ -123,6 +132,512 @@ where
     }
 }
 
+fn parse_node_ascii_v2<T>(reader: &mut BufReader<File>) -> Vec<(usize, Vec<T>)>
+where
+    T: FromStr + FromBytes + std::fmt::Debug,
+    <T as FromBytes>::Bytes: Sized,
+{
+    let mut nodes = Vec::new();
+    let mut line = String::new();
+
+    let _ = reader.read_line(&mut line);
+    let num_nodes = line
+        .trim()
+        .parse::<usize>()
+        .expect("Cout not parse number of nodes");
+
+    for _ in 0..num_nodes {
+        line.clear();
+        let _ = reader.read_line(&mut line);
+
+        let node_line = line.trim().split(" ").collect::<Vec<_>>();
+        let (tag, coords) = node_line.split_at(1);
+
+        let tag = tag[0].parse::<usize>().expect("Could not parse node tag");
+        let coords = coords
+            .iter()
+            .map(|c| {
+                if let Ok(d) = T::from_str(c) {
+                    d
+                } else {
+                    panic!("Could not parse coords")
+                }
+            })
+            .collect::<Vec<_>>();
+
+        nodes.push((tag, coords));
+    }
+
+    nodes
+}
+
+fn parse_element_ascii_v2(
+    reader: &mut BufReader<File>,
+) -> Vec<(usize, Vec<usize>, ReferenceCellType, usize)> {
+    let mut elements = Vec::new();
+    let mut line = String::new();
+
+    let _ = reader.read_line(&mut line);
+    let num_elements = line
+        .trim()
+        .parse::<usize>()
+        .expect("Cout not parse number of nodes");
+
+    for _ in 0..num_elements {
+        line.clear();
+        let Ok(_) = reader.read_line(&mut line) else {
+            panic!("Unable to read element line");
+        };
+        let line = line.trim().split(" ").collect::<Vec<&str>>();
+
+        let (a, rem_line) = line.split_at(3);
+        let [tag, element_type, num_tags] = a
+            .iter()
+            .map(|i| {
+                i.parse::<usize>()
+                    .expect("Could not parse element tag and type")
+            })
+            .collect::<Vec<_>>()[..]
+        else {
+            panic!("Unrecognised format");
+        };
+
+        let (_, node_tags) = rem_line.split_at(num_tags);
+        let node_tags = node_tags
+            .iter()
+            .map(|i| {
+                i.parse::<usize>()
+                    .expect("Could not parse nodes for element")
+            })
+            .collect::<Vec<_>>();
+        let (cell_type, degree) = interpret_gmsh_cell(element_type);
+        let gmsh_perm = get_permutation_to_gmsh(cell_type, degree);
+
+        let mut cell = vec![0; node_tags.len()];
+        for (i, j) in gmsh_perm.iter().enumerate() {
+            cell[*j] = node_tags[i];
+        }
+
+        elements.push((tag, cell, cell_type, degree));
+    }
+    elements
+}
+
+fn parse_node_ascii_v4<T>(reader: &mut BufReader<File>) -> Vec<(usize, Vec<T>)>
+where
+    T: FromStr + FromBytes + std::fmt::Debug,
+    <T as FromBytes>::Bytes: Sized,
+{
+    let mut nodes = Vec::new();
+    let mut line = String::new();
+
+    let _ = reader.read_line(&mut line);
+    let [num_entity_blocks, _num_nodes, _min_node_tag, _max_node_tag] = line
+        .trim()
+        .split(" ")
+        .map(|i| i.parse::<usize>().unwrap())
+        .collect::<Vec<_>>()[..]
+    else {
+        panic!("Unrecognised gmsh format for node blocks");
+    };
+
+    for _ in 0..num_entity_blocks {
+        line.clear();
+        let _ = reader.read_line(&mut line);
+
+        let [_entity_dim, _entity_tag, parametric, num_nodes_in_block] = line
+            .trim()
+            .split(" ")
+            .map(|i| i.parse::<usize>().unwrap())
+            .collect::<Vec<_>>()[..]
+        else {
+            panic!("Unrecognised gmsh format for nodes");
+        };
+        if parametric == 1 {
+            unimplemented!("Parametric nodes currently not supported")
+        }
+
+        let mut tags = Vec::new();
+        for _ in 0..num_nodes_in_block {
+            line.clear();
+            let _ = reader.read_line(&mut line);
+
+            tags.push(line.trim().parse::<usize>().expect("Could not parse tag"));
+        }
+
+        let mut coords = Vec::new();
+        for _ in 0..num_nodes_in_block {
+            line.clear();
+            let _ = reader.read_line(&mut line);
+
+            let coord = line
+                .trim()
+                .split(" ")
+                .map(|i| {
+                    if let Ok(j) = T::from_str(i) {
+                        j
+                    } else {
+                        panic!("Could not parse coordinate");
+                    }
+                })
+                .collect::<Vec<_>>();
+            coords.push(coord);
+        }
+
+        for (t, c) in izip!(tags, coords) {
+            nodes.push((t, c));
+        }
+    }
+    nodes
+}
+
+fn parse_element_ascii_v4(
+    reader: &mut BufReader<File>,
+) -> Vec<(usize, Vec<usize>, ReferenceCellType, usize)> {
+    let mut elements = Vec::new();
+    let mut line = String::new();
+
+    let _ = reader.read_line(&mut line);
+    let [
+        num_entity_blocks,
+        _num_elements,
+        _min_element_tag,
+        _max_element_tag,
+    ] = line
+        .trim()
+        .split(" ")
+        .map(|i| i.parse::<usize>().unwrap())
+        .collect::<Vec<_>>()[..]
+    else {
+        panic!("Unrecognised gmsh format");
+    };
+
+    for _ in 0..num_entity_blocks {
+        line.clear();
+        let _ = reader.read_line(&mut line);
+        let [
+            _entity_dim,
+            _entity_tag,
+            element_type,
+            num_elements_in_block,
+        ] = line
+            .trim()
+            .split(" ")
+            .map(|i| i.parse::<usize>().unwrap())
+            .collect::<Vec<_>>()[..]
+        else {
+            panic!("Unrecognised gmsh format");
+        };
+        let (cell_type, degree) = interpret_gmsh_cell(element_type);
+        let gmsh_perm = get_permutation_to_gmsh(cell_type, degree);
+
+        for _ in 0..num_elements_in_block {
+            line.clear();
+            let _ = reader.read_line(&mut line);
+
+            let parsed_line = line
+                .trim()
+                .split(" ")
+                .map(|i| i.parse::<usize>().unwrap())
+                .collect::<Vec<_>>();
+            let (tag, nodes) = parsed_line.split_at(1);
+            let mut cell = vec![0; nodes.len()];
+            for (i, j) in gmsh_perm.iter().enumerate() {
+                cell[*j] = nodes[i];
+            }
+            elements.push((tag[0], cell, cell_type, degree));
+        }
+    }
+
+    elements
+}
+
+fn parse_node_binary_v2<T>(
+    reader: &mut BufReader<File>,
+    data_size: usize,
+    is_le: bool,
+) -> Vec<(usize, Vec<T>)>
+where
+    T: FromStr + FromBytes + std::fmt::Debug,
+    <T as FromBytes>::Bytes: Sized,
+{
+    let mut nodes = Vec::new();
+    let mut line = String::new();
+    let mut buf = Vec::new();
+
+    line.clear();
+    let Ok(_) = reader.read_line(&mut line) else {
+        panic!("Unable to read num nodes");
+    };
+    let num_nodes = line
+        .trim()
+        .parse::<usize>()
+        .expect("Could not parse num nodes");
+
+    for _ in 0..num_nodes {
+        read_exact!(reader, buf, GMSH_INT_SIZE, "Unable to read node tag");
+        let tag = parse::<usize>(&buf, GMSH_INT_SIZE, is_le);
+
+        read_exact!(reader, buf, 3 * data_size, "Unable to read node coords");
+        let coords = buf
+            .chunks(data_size)
+            .map(|i| parse::<T>(i, data_size, is_le))
+            .collect::<Vec<_>>();
+
+        nodes.push((tag, coords));
+    }
+
+    nodes
+}
+
+fn parse_element_binary_v2(
+    reader: &mut BufReader<File>,
+    is_le: bool,
+) -> Vec<(usize, Vec<usize>, ReferenceCellType, usize)> {
+    let mut elements = Vec::new();
+    let mut line = String::new();
+    let mut buf = Vec::new();
+
+    let Ok(_) = reader.read_line(&mut line) else {
+        panic!("Unable to read num elements")
+    };
+    let num_elements = line
+        .trim()
+        .parse::<usize>()
+        .expect("Could not parse num elements");
+
+    for _ in 0..num_elements {
+        read_exact!(
+            reader,
+            buf,
+            3 * GMSH_INT_SIZE,
+            "Unable to element tag and type"
+        );
+        let [elm_type, _num_elm_follow, num_tags] = buf
+            .chunks(GMSH_INT_SIZE)
+            .map(|i| parse::<usize>(i, GMSH_INT_SIZE, is_le))
+            .collect::<Vec<_>>()[..]
+        else {
+            panic!("Could not parse element tag and type")
+        };
+
+        read_exact!(reader, buf, GMSH_INT_SIZE, "Unable to read num tags");
+        let tag = parse::<usize>(&buf, 4, is_le);
+
+        // Skip tags
+        read_exact!(
+            reader,
+            buf,
+            num_tags * GMSH_INT_SIZE,
+            "Unable to read element tags"
+        );
+
+        let (cell_type, degree) = interpret_gmsh_cell(elm_type);
+        let gmsh_perm = get_permutation_to_gmsh(cell_type, degree);
+
+        read_exact!(
+            reader,
+            buf,
+            gmsh_perm.len() * GMSH_INT_SIZE,
+            "Unable to read element node tags"
+        );
+        let node_tags = buf
+            .chunks(GMSH_INT_SIZE)
+            .map(|i| parse::<usize>(i, GMSH_INT_SIZE, is_le))
+            .collect::<Vec<_>>();
+
+        let mut cell = vec![0; node_tags.len()];
+        for (i, j) in gmsh_perm.iter().enumerate() {
+            cell[*j] = node_tags[i];
+        }
+
+        elements.push((tag, cell, cell_type, degree));
+    }
+
+    elements
+}
+
+fn parse_node_binary_v4<T>(
+    reader: &mut BufReader<File>,
+    data_size: usize,
+    is_le: bool,
+) -> Vec<(usize, Vec<T>)>
+where
+    T: FromStr + FromBytes + std::fmt::Debug,
+    <T as FromBytes>::Bytes: Sized,
+{
+    let mut nodes = Vec::new();
+    let mut buf = Vec::new();
+
+    read_exact!(
+        reader,
+        buf,
+        4 * data_size,
+        "Unable to read node section info"
+    );
+    let [num_entity_blocks, _num_nodes, _min_node_tag, _max_node_tag] = buf
+        .chunks(data_size)
+        .map(|i| parse::<usize>(i, data_size, is_le))
+        .collect::<Vec<_>>()[..]
+    else {
+        panic!("Could not parse node section info")
+    };
+
+    for _ in 0..num_entity_blocks {
+        read_exact!(
+            reader,
+            buf,
+            3 * GMSH_INT_SIZE,
+            "Unable to read node entity block info"
+        );
+        let [_entity_dim, _entity_tag, parametric] = buf
+            .chunks(GMSH_INT_SIZE)
+            .map(|i| parse::<usize>(i, GMSH_INT_SIZE, is_le))
+            .collect::<Vec<_>>()[..]
+        else {
+            panic!("Could not parse node entity block info")
+        };
+
+        if parametric == 1 {
+            unimplemented!("Parametric nodes currently not supported")
+        }
+
+        read_exact!(reader, buf, data_size, "Unable to read num nodes in block");
+        let num_nodes_in_block = parse::<usize>(&buf, data_size, is_le);
+
+        read_exact!(
+            reader,
+            buf,
+            num_nodes_in_block * data_size,
+            "Unable to read node tags"
+        );
+        let tags = buf
+            .chunks(data_size)
+            .map(|i| parse::<usize>(i, data_size, is_le))
+            .collect::<Vec<_>>();
+
+        read_exact!(
+            reader,
+            buf,
+            3 * num_nodes_in_block * data_size,
+            "Unable to read node coords"
+        );
+        let coords = buf
+            .chunks(3 * data_size)
+            .map(|i| {
+                i.chunks(data_size)
+                    .map(|j| parse::<T>(j, data_size, is_le))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+
+        for (t, c) in izip!(tags, coords) {
+            nodes.push((t, c));
+        }
+    }
+
+    nodes
+}
+
+fn parse_element_binary_v4(
+    reader: &mut BufReader<File>,
+    data_size: usize,
+    is_le: bool,
+) -> Vec<(usize, Vec<usize>, ReferenceCellType, usize)> {
+    let mut elements = Vec::new();
+    let mut buf = Vec::new();
+
+    read_exact!(
+        reader,
+        buf,
+        4 * data_size,
+        "Unable to read element section info"
+    );
+    let [
+        num_entity_blocks,
+        _num_elements,
+        _min_element_tag,
+        _max_element_tag,
+    ] = buf
+        .chunks(data_size)
+        .map(|i| parse::<usize>(i, data_size, is_le))
+        .collect::<Vec<_>>()[..]
+    else {
+        panic!("Could not parse element section info")
+    };
+
+    for _ in 0..num_entity_blocks {
+        read_exact!(
+            reader,
+            buf,
+            3 * GMSH_INT_SIZE,
+            "Unable to read element entity block info"
+        );
+        let [_entity_dim, _entity_tag, element_type] = buf
+            .chunks(GMSH_INT_SIZE)
+            .map(|i| parse::<usize>(i, GMSH_INT_SIZE, is_le))
+            .collect::<Vec<_>>()[..]
+        else {
+            panic!("Could not parse element entity block info")
+        };
+
+        read_exact!(
+            reader,
+            buf,
+            data_size,
+            "Unable to read num elements in block"
+        );
+        let num_elements_in_block = parse::<usize>(&buf, data_size, is_le);
+
+        let (cell_type, degree) = interpret_gmsh_cell(element_type);
+        let gmsh_perm = get_permutation_to_gmsh(cell_type, degree);
+
+        for _ in 0..num_elements_in_block {
+            read_exact!(reader, buf, data_size, "Unable to read element tag");
+            let tag = parse::<usize>(&buf, data_size, is_le);
+
+            read_exact!(
+                reader,
+                buf,
+                data_size * gmsh_perm.len(),
+                "Unable to read node tags"
+            );
+            let node_tags = buf
+                .chunks(data_size)
+                .map(|i| parse::<usize>(i, data_size, is_le))
+                .collect::<Vec<_>>();
+
+            let mut cell = vec![0; node_tags.len()];
+            for (i, j) in gmsh_perm.iter().enumerate() {
+                cell[*j] = node_tags[i];
+            }
+
+            elements.push((tag, cell, cell_type, degree));
+        }
+    }
+    elements
+}
+
+fn parse_datasize_and_endianness(reader: &mut BufReader<File>, data_size: &str) -> (usize, bool) {
+    let data_size = data_size
+        .parse::<usize>()
+        .expect("Unable to parse data size");
+
+    assert!(
+        data_size <= std::mem::size_of::<usize>(),
+        "Unsupported data size"
+    );
+
+    let mut buf = [0u8; GMSH_INT_SIZE];
+    reader
+        .read_exact(&mut buf)
+        .expect("Unable to read endianness");
+
+    let is_le = u32::from_le_bytes(buf) == 1;
+
+    (data_size, is_le)
+}
+
 impl<G: Grid<EntityDescriptor = ReferenceCellType>> GmshExport for G {
     fn to_gmsh_string(&self) -> String {
         let tdim = self.topology_dim();
@@ -227,38 +742,25 @@ impl<G: Grid<EntityDescriptor = ReferenceCellType>> GmshExport for G {
     }
 }
 
-/// Get a section from a gmsh string
-fn gmsh_section(s: &str, section: &str) -> String {
-    let a = s.split(&format!("${section}\n")).collect::<Vec<_>>();
-    if a.len() <= 1 {
-        panic!("Section not found: {section}");
-    }
-    String::from(a[1].split(&format!("\n$End{section}")).collect::<Vec<_>>()[0])
-}
-
 impl<T, B> GmshImport for B
 where
     T: FromStr + FromBytes + std::fmt::Debug,
     <T as FromBytes>::Bytes: Sized,
     B: Builder<T = T, EntityDescriptor = ReferenceCellType>,
 {
-    fn import_from_gmsh_v1(&mut self, s: String) {
-        // Load nodes
-        let nodes = gmsh_section(&s, "Nodes");
-        let mut nodes = nodes.lines();
+    fn import_from_v1(&mut self, mut reader: BufReader<File>) {
+        let mut line = String::new();
 
-        let Some(num_nodes) = nodes.next() else {
-            panic!("Could not read num nodes");
-        };
-        let num_nodes = num_nodes
+        let _ = reader.read_line(&mut line);
+        let num_nodes = line
+            .trim()
             .parse::<usize>()
             .expect("Could not parse num nodes");
 
         for _ in 0..num_nodes {
-            let Some(line) = nodes.next() else {
-                panic!("Unable to read node line");
-            };
-            let line = line.split(" ").collect::<Vec<&str>>();
+            line.clear();
+            let _ = reader.read_line(&mut line);
+            let line = line.trim().split(" ").collect::<Vec<&str>>();
 
             let (tag, coords) = line.split_at(1);
             let tag = tag[0].parse::<usize>().expect("Could not parse node tag");
@@ -273,27 +775,26 @@ where
                 })
                 .collect::<Vec<_>>();
 
-            println!("{coords:?}");
             self.add_point(tag, &coords[..self.gdim()]);
-            println!("ADDED");
         }
 
-        // Load elements
-        let elements = gmsh_section(&s, "Elements");
-        let mut elements = elements.lines();
+        // Skip $NOD line.
+        let _ = reader.read_line(&mut line);
 
-        let Some(num_elements) = elements.next() else {
-            panic!("Could not read num nodes");
-        };
-        let num_elements = num_elements
+        // Skip $ELM line.
+        let _ = reader.read_line(&mut line);
+
+        line.clear();
+        let _ = reader.read_line(&mut line);
+        let num_elements = line
+            .trim()
             .parse::<usize>()
             .expect("Could not parse num nodes");
 
         for _ in 0..num_elements {
-            let Some(line) = elements.next() else {
-                panic!("Unable to read element line");
-            };
-            let line = line.split(" ").collect::<Vec<&str>>();
+            line.clear();
+            let _ = reader.read_line(&mut line);
+            let line = line.trim().split(" ").collect::<Vec<&str>>();
 
             let (a, node_tags) = line.split_at(5);
             let [tag, element_type, ..] = a
@@ -326,106 +827,50 @@ where
         }
     }
 
-    fn import_from_gmsh_string_v2(&mut self, s: String) {
-        // Load nodes
-        let nodes = gmsh_section(&s, "Nodes");
-        let mut nodes = nodes.lines();
-
-        let Some(num_nodes) = nodes.next() else {
-            panic!("Could not read num nodes");
-        };
-        let num_nodes = num_nodes
-            .parse::<usize>()
-            .expect("Could not parse num nodes");
-
-        for _ in 0..num_nodes {
-            let Some(line) = nodes.next() else {
-                panic!("Unable to read node line");
-            };
-            let line = line.split(" ").collect::<Vec<&str>>();
-
-            let (tag, coords) = line.split_at(1);
-            let tag = tag[0].parse::<usize>().expect("Could not parse node tag");
-            let coords = coords
-                .iter()
-                .map(|c| {
-                    if let Ok(d) = T::from_str(c) {
-                        d
-                    } else {
-                        panic!("Could not parse coords")
-                    }
-                })
-                .collect::<Vec<_>>();
-
-            self.add_point(tag, &coords[..self.gdim()]);
-        }
-
-        // Load elements
-        let elements = gmsh_section(&s, "Elements");
-        let mut elements = elements.lines();
-
-        let Some(num_elements) = elements.next() else {
-            panic!("Could not read num nodes");
-        };
-        let num_elements = num_elements
-            .parse::<usize>()
-            .expect("Could not parse num nodes");
-
-        for _ in 0..num_elements {
-            let Some(line) = elements.next() else {
-                panic!("Unable to read element line");
-            };
-            let line = line.split(" ").collect::<Vec<&str>>();
-
-            let (a, rem_line) = line.split_at(3);
-            let [tag, element_type, num_tags] = a
-                .iter()
-                .map(|i| {
-                    i.parse::<usize>()
-                        .expect("Could not parse element tag and type")
-                })
-                .collect::<Vec<_>>()[..]
-            else {
-                panic!("Unrecognised format");
-            };
-
-            let (_, node_tags) = rem_line.split_at(num_tags);
-            let node_tags = node_tags
-                .iter()
-                .map(|i| {
-                    i.parse::<usize>()
-                        .expect("Could not parse nodes for element")
-                })
-                .collect::<Vec<_>>();
-            let (cell_type, degree) = interpret_gmsh_cell(element_type);
-            let gmsh_perm = get_permutation_to_gmsh(cell_type, degree);
-
-            let mut cell = vec![0; node_tags.len()];
-            for (i, j) in gmsh_perm.iter().enumerate() {
-                cell[*j] = node_tags[i];
-            }
-
-            self.add_cell_from_nodes_and_type(tag, &cell, cell_type, degree);
-        }
-    }
-
-    fn import_from_gmsh_binary_v2(
+    fn import_from_v2_v4(
         &mut self,
         mut reader: BufReader<File>,
-        data_size: usize,
-        is_le: bool,
+        version: &str,
+        binary_mode: &str,
+        data_size: &str,
     ) {
+        let is_binary = binary_mode == "1";
+        let (data_size, is_le) = if is_binary {
+            parse_datasize_and_endianness(&mut reader, data_size)
+        } else {
+            (0usize, false)
+        };
+
         let mut line = String::new();
-        let mut buf = Vec::new();
+        let is_v2 = version.starts_with("2");
 
-        macro_rules! read_exact {
-            ($size: expr, $msg: expr) => {{
-                buf.resize($size, 0);
-                reader.read_exact(&mut buf).expect($msg);
-            }};
-        }
+        let parse_nodes = |reader: &mut BufReader<File>| {
+            if is_v2 {
+                if is_binary {
+                    parse_node_binary_v2(reader, data_size, is_le)
+                } else {
+                    parse_node_ascii_v2(reader)
+                }
+            } else if is_binary {
+                parse_node_binary_v4(reader, data_size, is_le)
+            } else {
+                parse_node_ascii_v4(reader)
+            }
+        };
 
-        const GMSH_INT_SIZE: usize = 4;
+        let parse_elements = |reader: &mut BufReader<File>| {
+            if is_v2 {
+                if is_binary {
+                    parse_element_binary_v2(reader, is_le)
+                } else {
+                    parse_element_ascii_v2(reader)
+                }
+            } else if is_binary {
+                parse_element_binary_v4(reader, data_size, is_le)
+            } else {
+                parse_element_ascii_v4(reader)
+            }
+        };
 
         loop {
             let Ok(num_bytes) = reader.read_line(&mut line) else {
@@ -438,324 +883,18 @@ where
             }
 
             match line.trim() {
-                // Load all nodes.
                 "$Nodes" => {
-                    line.clear();
-                    let Ok(_) = reader.read_line(&mut line) else {
-                        panic!("Unable to read num nodes");
-                    };
-                    let num_nodes = line
-                        .trim()
-                        .parse::<usize>()
-                        .expect("Could not parse num nodes");
-
-                    for _ in 0..num_nodes {
-                        read_exact!(GMSH_INT_SIZE, "Unable to read node tag");
-                        let tag = parse::<usize>(&buf, GMSH_INT_SIZE, is_le);
-
-                        read_exact!(3 * data_size, "Unable to read node coords");
-                        let coords = buf
-                            .chunks(data_size)
-                            .map(|i| parse::<T>(i, data_size, is_le))
-                            .collect::<Vec<_>>();
-
-                        self.add_point(tag, &coords[..self.gdim()]);
-                    }
-
+                    let nodes = parse_nodes(&mut reader);
+                    nodes.iter().for_each(|(tag, coords)| {
+                        self.add_point(*tag, &coords[..self.gdim()]);
+                    });
                     line.clear();
                 }
-                // Load all elements.
                 "$Elements" => {
-                    line.clear();
-                    let Ok(_) = reader.read_line(&mut line) else {
-                        panic!("Unable to read num elements")
-                    };
-                    let num_elements = line
-                        .trim()
-                        .parse::<usize>()
-                        .expect("Could not parse num elements");
-
-                    for _ in 0..num_elements {
-                        read_exact!(3 * GMSH_INT_SIZE, "Unable to element tag and type");
-                        let [elm_type, _num_elm_follow, num_tags] = buf
-                            .chunks(GMSH_INT_SIZE)
-                            .map(|i| parse::<usize>(i, GMSH_INT_SIZE, is_le))
-                            .collect::<Vec<_>>()[..]
-                        else {
-                            panic!("Could not parse element tag and type")
-                        };
-
-                        read_exact!(GMSH_INT_SIZE, "Unable to read num tags");
-                        let tag = parse::<usize>(&buf, 4, is_le);
-
-                        // Skip tags
-                        read_exact!(num_tags * GMSH_INT_SIZE, "Unable to read element tags");
-
-                        let (cell_type, degree) = interpret_gmsh_cell(elm_type);
-                        let gmsh_perm = get_permutation_to_gmsh(cell_type, degree);
-
-                        read_exact!(
-                            gmsh_perm.len() * GMSH_INT_SIZE,
-                            "Unable to read element node tags"
-                        );
-                        let node_tags = buf
-                            .chunks(GMSH_INT_SIZE)
-                            .map(|i| parse::<usize>(i, GMSH_INT_SIZE, is_le))
-                            .collect::<Vec<_>>();
-
-                        let mut cell = vec![0; node_tags.len()];
-                        for (i, j) in gmsh_perm.iter().enumerate() {
-                            cell[*j] = node_tags[i];
-                        }
-
-                        self.add_cell_from_nodes_and_type(tag, &cell, cell_type, degree);
-                    }
-                    line.clear();
-                }
-                _ => {
-                    line.clear();
-                }
-            }
-        }
-    }
-
-    fn import_from_gmsh_string_v4(&mut self, s: String) {
-        // Load nodes
-        let nodes = gmsh_section(&s, "Nodes");
-        let nodes = nodes.lines().collect::<Vec<_>>();
-
-        let [num_entity_blocks, _num_nodes, _min_node_tag, _max_node_tag] = nodes[0]
-            .trim()
-            .split(" ")
-            .map(|i| i.parse::<usize>().unwrap())
-            .collect::<Vec<_>>()[..]
-        else {
-            panic!("Unrecognised gmsh format for node blocks");
-        };
-
-        let mut line_n = 1;
-        for _ in 0..num_entity_blocks {
-            let [_entity_dim, _entity_tag, parametric, num_nodes_in_block] = nodes[line_n]
-                .trim()
-                .split(" ")
-                .map(|i| i.parse::<usize>().unwrap())
-                .collect::<Vec<_>>()[..]
-            else {
-                panic!("Unrecognised gmsh format for nodes");
-            };
-            if parametric == 1 {
-                unimplemented!("Parametric nodes currently not supported")
-            }
-            line_n += 1;
-            let tags = &nodes[line_n..line_n + num_nodes_in_block];
-            let coords = &nodes[line_n + num_nodes_in_block..line_n + 2 * num_nodes_in_block];
-            for (t, c) in izip!(tags, coords) {
-                let pt = c
-                    .trim()
-                    .split(" ")
-                    .map(|i| {
-                        if let Ok(j) = T::from_str(i) {
-                            j
-                        } else {
-                            panic!("Could not parse coordinate");
-                        }
-                    })
-                    .collect::<Vec<_>>();
-                self.add_point(t.parse::<usize>().unwrap(), &pt[..self.gdim()]);
-            }
-            line_n += num_nodes_in_block * 2;
-        }
-
-        // Load elements
-        let elements = gmsh_section(&s, "Elements");
-        let elements = elements.lines().collect::<Vec<_>>();
-
-        let [
-            num_entity_blocks,
-            _num_elements,
-            _min_element_tag,
-            _max_element_tag,
-        ] = elements[0]
-            .trim()
-            .split(" ")
-            .map(|i| i.parse::<usize>().unwrap())
-            .collect::<Vec<_>>()[..]
-        else {
-            panic!("Unrecognised gmsh format");
-        };
-
-        let mut line_n = 1;
-        for _ in 0..num_entity_blocks {
-            let [
-                _entity_dim,
-                _entity_tag,
-                element_type,
-                num_elements_in_block,
-            ] = elements[line_n]
-                .trim()
-                .split(" ")
-                .map(|i| i.parse::<usize>().unwrap())
-                .collect::<Vec<_>>()[..]
-            else {
-                panic!("Unrecognised gmsh format");
-            };
-            let (cell_type, degree) = interpret_gmsh_cell(element_type);
-            let gmsh_perm = get_permutation_to_gmsh(cell_type, degree);
-
-            line_n += 1;
-            for line in &elements[line_n..line_n + num_elements_in_block] {
-                let line = line
-                    .trim()
-                    .split(" ")
-                    .map(|i| i.parse::<usize>().unwrap())
-                    .collect::<Vec<_>>();
-                let mut cell = vec![0; line.len() - 1];
-                for (i, j) in gmsh_perm.iter().enumerate() {
-                    cell[*j] = line[i + 1];
-                }
-                self.add_cell_from_nodes_and_type(line[0], &cell, cell_type, degree);
-            }
-
-            line_n += num_elements_in_block;
-        }
-    }
-
-    fn import_from_gmsh_binary_v4(
-        &mut self,
-        mut reader: BufReader<File>,
-        data_size: usize,
-        is_le: bool,
-    ) {
-        let mut line = String::new();
-        let mut buf = Vec::new();
-
-        macro_rules! read_exact {
-            ($size: expr, $msg: expr) => {{
-                buf.resize($size, 0);
-                reader.read_exact(&mut buf).expect($msg);
-            }};
-        }
-
-        const GMSH_INT_SIZE: usize = 4;
-
-        loop {
-            let Ok(num_bytes) = reader.read_line(&mut line) else {
-                continue;
-            };
-
-            // EOF reached.
-            if num_bytes == 0 {
-                break;
-            }
-
-            match line.trim() {
-                // Load all nodes.
-                "$Nodes" => {
-                    read_exact!(4 * data_size, "Unable to read node section info");
-                    let [num_entity_blocks, _num_nodes, _min_node_tag, _max_node_tag] = buf
-                        .chunks(data_size)
-                        .map(|i| parse::<usize>(i, data_size, is_le))
-                        .collect::<Vec<_>>()[..]
-                    else {
-                        panic!("Could not parse node section info")
-                    };
-
-                    for _ in 0..num_entity_blocks {
-                        read_exact!(3 * GMSH_INT_SIZE, "Unable to read node entity block info");
-                        let [_entity_dim, _entity_tag, parametric] = buf
-                            .chunks(GMSH_INT_SIZE)
-                            .map(|i| parse::<usize>(i, GMSH_INT_SIZE, is_le))
-                            .collect::<Vec<_>>()[..]
-                        else {
-                            panic!("Could not parse node entity block info")
-                        };
-
-                        if parametric == 1 {
-                            unimplemented!("Parametric nodes currently not supported")
-                        }
-
-                        read_exact!(data_size, "Unable to read num nodes in block");
-                        let num_nodes_in_block = parse::<usize>(&buf, data_size, is_le);
-
-                        read_exact!(num_nodes_in_block * data_size, "Unable to read node tags");
-                        let tags = buf
-                            .chunks(data_size)
-                            .map(|i| parse::<usize>(i, data_size, is_le))
-                            .collect::<Vec<_>>();
-
-                        read_exact!(
-                            3 * num_nodes_in_block * data_size,
-                            "Unable to read node coords"
-                        );
-                        let coords = buf
-                            .chunks(3 * data_size)
-                            .map(|i| {
-                                i.chunks(data_size)
-                                    .map(|j| parse::<T>(j, data_size, is_le))
-                                    .collect::<Vec<_>>()
-                            })
-                            .collect::<Vec<_>>();
-
-                        for (t, c) in izip!(tags, coords) {
-                            self.add_point(t, &c[..self.gdim()]);
-                        }
-                    }
-
-                    line.clear();
-                }
-                // Load all elements.
-                "$Elements" => {
-                    read_exact!(4 * data_size, "Unable to read element section info");
-                    let [
-                        num_entity_blocks,
-                        _num_elements,
-                        _min_element_tag,
-                        _max_element_tag,
-                    ] = buf
-                        .chunks(data_size)
-                        .map(|i| parse::<usize>(i, data_size, is_le))
-                        .collect::<Vec<_>>()[..]
-                    else {
-                        panic!("Could not parse element section info")
-                    };
-
-                    for _ in 0..num_entity_blocks {
-                        read_exact!(
-                            3 * GMSH_INT_SIZE,
-                            "Unable to read element entity block info"
-                        );
-                        let [_entity_dim, _entity_tag, element_type] = buf
-                            .chunks(GMSH_INT_SIZE)
-                            .map(|i| parse::<usize>(i, GMSH_INT_SIZE, is_le))
-                            .collect::<Vec<_>>()[..]
-                        else {
-                            panic!("Could not parse element entity block info")
-                        };
-
-                        read_exact!(data_size, "Unable to read num elements in block");
-                        let num_elements_in_block = parse::<usize>(&buf, data_size, is_le);
-
-                        let (cell_type, degree) = interpret_gmsh_cell(element_type);
-                        let gmsh_perm = get_permutation_to_gmsh(cell_type, degree);
-
-                        for _ in 0..num_elements_in_block {
-                            read_exact!(data_size, "Unable to read element tag");
-                            let tag = parse::<usize>(&buf, data_size, is_le);
-
-                            read_exact!(data_size * gmsh_perm.len(), "Unable to read node tags");
-                            let node_tags = buf
-                                .chunks(data_size)
-                                .map(|i| parse::<usize>(i, data_size, is_le))
-                                .collect::<Vec<_>>();
-
-                            let mut cell = vec![0; node_tags.len()];
-                            for (i, j) in gmsh_perm.iter().enumerate() {
-                                cell[*j] = node_tags[i];
-                            }
-
-                            self.add_cell_from_nodes_and_type(tag, &cell, cell_type, degree);
-                        }
-                    }
+                    let elements = parse_elements(&mut reader);
+                    elements.iter().for_each(|(tag, cell, cell_type, degree)| {
+                        self.add_cell_from_nodes_and_type(*tag, &cell, *cell_type, *degree);
+                    });
                     line.clear();
                 }
                 _ => {
